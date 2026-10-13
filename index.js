@@ -419,9 +419,9 @@ app.post('/api/Pagos', verificarToken, async (req, res) => {
     const client = await pool.connect();
 
     try {
-        // 1. Extraemos los datos del token (usando tu formato req.user)
+        // 1. Extraemos los datos del token
         const id_negocio = req.user.id_negocio;
-        const id_usuario = req.user.id_usuario; // Asumo que el ID del cajero lo guardás así
+        const id_usuario = req.user.id_usuario; // Ya no lo usamos para bloquear la caja
 
         const { cart, total, tipo_medio } = req.body;
 
@@ -436,26 +436,26 @@ app.post('/api/Pagos', verificarToken, async (req, res) => {
         // 🚀 INICIA LA TRANSACCIÓN SQL
         await client.query('BEGIN'); 
 
-        // 3. Verificamos que el cajero tenga su caja abierta
+        // 👇 3. EL CAMBIO CLAVE: Verificamos que haya ALGUNA caja abierta en el local
         const cajaCheck = await client.query(
             `SELECT id_caja FROM cajas_diarias 
-             WHERE id_usuario = $1 AND id_negocio = $2 AND estado = 'abierta'`,
-            [id_usuario, id_negocio]
+             WHERE id_negocio = $1 AND estado = 'abierta'`,
+            [id_negocio]
         );
 
         if (cajaCheck.rows.length === 0) {
             await client.query('ROLLBACK');
-            return res.status(403).json({ error: "Tenés que abrir la caja antes de cobrar." });
+            return res.status(403).json({ error: "No hay ninguna caja abierta en el local para registrar la venta." });
         }
         const id_caja = cajaCheck.rows[0].id_caja;
 
         // 4. Creamos el ticket general (Tabla Pagos)
         const pagoQuery = `
-            INSERT INTO pagos (id_negocio, id_caja, monto, tipo_medio)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO pagos (id_negocio, id_caja,id_usuario, monto, tipo_medio)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id_pago
         `;
-        const pagoResult = await client.query(pagoQuery, [id_negocio, id_caja, total, tipo_medio]);
+        const pagoResult = await client.query(pagoQuery, [id_negocio, id_caja, id_usuario, total, tipo_medio]);
         const id_pago = pagoResult.rows[0].id_pago;
 
         // 5. Guardamos el detalle y descontamos stock (Iterando el carrito)
@@ -497,6 +497,293 @@ app.post('/api/Pagos', verificarToken, async (req, res) => {
     }
 });
 
+app.post('/api/Cajas/abrir', verificarToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { monto_inicial } = req.body;
+        const id_negocio = req.user.id_negocio;
+        const id_usuario = req.user.id_usuario; // Guardamos quién la abrió para el ticket
+
+        // 🛑 1. VALIDACIÓN CLAVE: ¿Ya hay una caja abierta en este negocio?
+        const checkResult = await client.query(
+            `SELECT id_caja FROM cajas_diarias 
+             WHERE id_negocio = $1 AND estado = 'abierta'`,
+            [id_negocio]
+        );
+
+        if (checkResult.rows.length > 0) {
+            // Si ya hay una, bloqueamos la creación
+            return res.status(400).json({ 
+                error: "Ya existe una caja abierta en el local. Cerrala antes de abrir otra." 
+            });
+        }
+
+        // ✅ 2. Si no hay ninguna abierta, la creamos tranquilos
+        const insertResult = await client.query(
+            `INSERT INTO cajas_diarias (id_negocio, id_usuario, monto_inicial, estado)
+             VALUES ($1, $2, $3, 'abierta') 
+             RETURNING id_caja`,
+            [id_negocio, id_usuario, monto_inicial]
+        );
+
+        res.status(200).json({ 
+            success: true, 
+            id_caja: insertResult.rows[0].id_caja,
+            message: "Caja abierta correctamente."
+        });
+
+    } catch (err) {
+        console.error("❌ Error al abrir caja:", err);
+        res.status(500).json({ error: "Error interno al intentar abrir la caja." });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/Cajas/estado', verificarToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const id_negocio = req.user.id_negocio;
+        // Ya no necesitamos el id_usuario acá
+
+        // 👇 Le sacamos el id_usuario al WHERE y dejamos solo id_negocio
+        const result = await client.query(
+            `SELECT id_caja, monto_inicial, fecha_apertura 
+             FROM cajas_diarias 
+             WHERE id_negocio = $1 AND estado = 'abierta'`,
+            [id_negocio]
+        );
+
+        if (result.rows.length > 0) {
+            // Si encontró una en el LOCAL, devolvemos abierta: true
+            return res.status(200).json({ abierta: true, caja: result.rows[0] });
+        } else {
+            // Si no encontró ninguna en todo el local
+            return res.status(200).json({ abierta: false });
+        }
+    } catch (err) {
+        console.error("❌ Error al verificar caja:", err);
+        res.status(500).json({ error: "Error al verificar el estado de la caja." });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/Cajas/resumen', verificarToken, async (req, res) => {
+    // Usamos tu pool de PostgreSQL
+    const client = await pool.connect();
+    try {
+        const id_negocio = req.user.id_negocio;
+        // 👇 Ya no hace falta el id_usuario para bloquear
+
+        // Paso 1: Buscamos la caja abierta de este NEGOCIO (sin importar el usuario)
+        const cajaResult = await client.query(
+            `SELECT id_caja, monto_inicial FROM cajas_diarias 
+             WHERE id_negocio = $1 AND estado = 'abierta'`,
+            [id_negocio]
+        );
+
+        if (cajaResult.rows.length === 0) {
+            return res.status(404).json({ error: "No hay ninguna caja abierta en el local." });
+        }
+
+        const id_caja = cajaResult.rows[0].id_caja;
+        const monto_inicial = parseFloat(cajaResult.rows[0].monto_inicial);
+
+        // Paso 2: Sumamos todas las ventas de esta caja, agrupadas por método de pago
+        const ventasResult = await client.query(
+            `SELECT tipo_medio, SUM(monto) as total_vendido 
+             FROM pagos 
+             WHERE id_caja = $1 
+             GROUP BY tipo_medio`,
+            [id_caja]
+        );
+
+        let total_ventas = 0;
+        let total_efectivo = 0;
+        let total_digital = 0;
+        const desglose = {};
+
+        // Paso 3: Acomodamos los números
+        ventasResult.rows.forEach(fila => {
+            const monto = parseFloat(fila.total_vendido);
+            total_ventas += monto;
+            desglose[fila.tipo_medio] = monto;
+            
+            // Si en tu frontend manda "efectivo", lo sumamos a la plata física
+            if (fila.tipo_medio === 'efectivo' || fila.tipo_medio === 'Efectivo') {
+                total_efectivo += monto;
+            } else {
+                total_digital += monto;
+            }
+        });
+
+        // La plata física que tiene que haber en el cajón (cambio inicial + ventas en efectivo)
+        const dinero_en_cajon = monto_inicial + total_efectivo;
+
+        res.status(200).json({
+            success: true,
+            resumen: {
+                monto_inicial,
+                total_ventas,
+                total_efectivo,
+                total_digital,
+                dinero_en_cajon,
+                desglose
+            }
+        });
+
+    } catch (err) {
+        console.error("❌ Error al obtener resumen:", err);
+        res.status(500).json({ error: "Error al calcular el resumen de la caja." });
+    } finally {
+        client.release();
+    }
+});
+
+app.put('/api/Cajas/cerrar', verificarToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        // Sacamos los datos del usuario logueado gracias a tu middleware verificarToken
+        const id_negocio = req.user.id_negocio;
+        const id_usuario = req.user.id_usuario;
+
+        // Actualizamos la caja a 'cerrada' y le metemos el timestamp actual de PostgreSQL
+        const result = await client.query(
+            `UPDATE cajas_diarias 
+             SET estado = 'cerrada', fecha_cierre = CURRENT_TIMESTAMP
+             WHERE id_usuario = $1 AND id_negocio = $2 AND estado = 'abierta'
+             RETURNING id_caja`,
+            [id_usuario, id_negocio]
+        );
+        console.log(result)
+        // Si rowCount es 0, significa que no encontró ninguna caja abierta para ese usuario
+        if (result.rowCount === 0) {
+            return res.status(400).json({ error: "No se encontró una caja abierta para cerrar." });
+        }
+
+        // Todo salió perfecto
+        res.status(200).json({ 
+            success: true, 
+            message: "Caja cerrada correctamente." 
+        });
+
+    } catch (err) {
+        console.error("❌ Error al cerrar caja:", err);
+        res.status(500).json({ error: "Error interno al cerrar la caja." });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/Cajas/historial', verificarToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const id_negocio = req.user.id_negocio;
+
+        // Traemos las últimas 50 cajas (ajustá el límite si querés más)
+        const result = await client.query(
+            `SELECT id_caja, monto_inicial, estado, fecha_cierre 
+             FROM cajas_diarias 
+             WHERE id_negocio = $1 
+             ORDER BY id_caja DESC 
+             LIMIT 50`,
+            [id_negocio]
+        );
+
+        res.status(200).json({ success: true, cajas: result.rows });
+    } catch (err) {
+        console.error("❌ ERROR REAL DE POSTGRES EN HISTORIAL:", err.message);
+        res.status(500).json({ error: "Error al cargar el historial de cajas." });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/Cajas/resumen/:id_caja', verificarToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const id_negocio = req.user.id_negocio;
+        const id_caja = req.params.id_caja;
+
+        // 1. Buscamos la caja específica
+        const cajaResult = await client.query(
+            `SELECT c.*, u.nombre as nombre_usuario 
+             FROM cajas_diarias c
+             LEFT JOIN usuarios u ON c.id_usuario = u.id_usuario
+             WHERE c.id_caja = $1 AND c.id_negocio = $2`,
+            [id_caja, id_negocio]
+        );
+
+        if (cajaResult.rows.length === 0) {
+            return res.status(404).json({ error: "Caja no encontrada." });
+        }
+
+        const caja = cajaResult.rows[0];
+        const monto_inicial = parseFloat(caja.monto_inicial);
+
+        // 2. Calculamos las ventas de ESA caja específica
+        const ventasResult = await client.query(
+            `SELECT tipo_medio, SUM(monto) as total_vendido 
+             FROM pagos WHERE id_caja = $1 GROUP BY tipo_medio`,
+            [id_caja]
+        );
+
+        let total_ventas = 0;
+        let total_efectivo = 0;
+        let desglose = {};
+
+        ventasResult.rows.forEach(fila => {
+            const monto = parseFloat(fila.total_vendido);
+            total_ventas += monto;
+            desglose[fila.tipo_medio] = monto;
+            if (fila.tipo_medio === 'efectivo' || fila.tipo_medio === 'Efectivo') {
+                total_efectivo += monto;
+            }
+        });
+
+        res.status(200).json({
+            success: true,
+            resumen: {
+                ...caja, // Mandamos los datos de la caja (fechas, etc)
+                total_ventas,
+                total_efectivo,
+                dinero_en_cajon: monto_inicial + total_efectivo,
+                desglose
+            }
+        });
+
+    } catch (err) {
+        console.error("❌ Error al obtener resumen específico:", err);
+        res.status(500).json({ error: "Error al calcular la caja." });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/Cajas/:id_caja/ventas', verificarToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const id_caja = req.params.id_caja;
+
+        // 👇 Hacemos JOIN con usuarios para traer el nombre
+        const result = await client.query(
+            `SELECT p.id_pago, p.monto, p.tipo_medio, p.hora, u.nombre as cajero
+             FROM pagos p
+             LEFT JOIN usuarios u ON p.id_usuario = u.id_usuario
+             WHERE p.id_caja = $1 
+             ORDER BY p.id_pago DESC`,
+            [id_caja]
+        );
+
+        res.status(200).json({ success: true, ventas: result.rows });
+    } catch (err) {
+        console.error("❌ Error al obtener ventas de la caja:", err.message);
+        res.status(500).json({ error: "Error al cargar el detalle de ventas." });
+    } finally {
+        client.release();
+    }
+});
 // 5. Iniciar el servidor
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
