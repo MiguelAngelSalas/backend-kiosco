@@ -578,8 +578,10 @@ app.get('/api/Cajas/resumen', verificarToken, async (req, res) => {
 
         // Paso 1: Buscamos la caja abierta de este NEGOCIO (sin importar el usuario)
         const cajaResult = await client.query(
-            `SELECT id_caja, monto_inicial FROM cajas_diarias 
-             WHERE id_negocio = $1 AND estado = 'abierta'`,
+            `SELECT c.id_caja, c.monto_inicial, u.nombre AS nombre_usuario 
+             FROM cajas_diarias c
+             LEFT JOIN usuarios u ON c.id_usuario = u.id_usuario
+             WHERE c.id_negocio = $1 AND c.estado = 'abierta'`,
             [id_negocio]
         );
 
@@ -589,6 +591,7 @@ app.get('/api/Cajas/resumen', verificarToken, async (req, res) => {
 
         const id_caja = cajaResult.rows[0].id_caja;
         const monto_inicial = parseFloat(cajaResult.rows[0].monto_inicial);
+        const nombre_usuario = cajaResult.rows[0].nombre_usuario || "Desconocido";
 
         // Paso 2: Sumamos todas las ventas de esta caja, agrupadas por método de pago
         const ventasResult = await client.query(
@@ -624,6 +627,7 @@ app.get('/api/Cajas/resumen', verificarToken, async (req, res) => {
         res.status(200).json({
             success: true,
             resumen: {
+                nombre_usuario,
                 monto_inicial,
                 total_ventas,
                 total_efectivo,
